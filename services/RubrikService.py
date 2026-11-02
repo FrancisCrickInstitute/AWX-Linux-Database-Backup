@@ -1,10 +1,12 @@
 import json
+
 import requests
 
 import config_backup as config
 from . import EmailService
 from .ErrorService import BackupError
 from .LoggerService import logger, LogLevel, TagLevel
+
 
 _tag = TagLevel.RUBRIK
 _access_token = None
@@ -13,99 +15,157 @@ _managed_volume_details = None
 
 def _run_query(payload: dict):
     """
-    Execute a GraphQL query against the Rubrik Security Cloud (RSC) API.
+    Execute a GraphQL query against the Rubrik Security Cloud API.
 
-    This function retrieves an access token, sends the provided GraphQL
-    payload to the RSC GraphQL endpoint, and returns the parsed JSON
-    response.
-
-    Note:
-        Rubrik's GraphQL API may return HTTP 200 even when the query
-        fails logically (e.g., no managed volume found). Consumers of
-        this function should validate the response content, not just
-        the HTTP status code.
-
-    Args:
-        payload (dict): GraphQL query and variables payload.
-
-    Returns:
-        dict: Parsed JSON response from the GraphQL API.
-
-    Raises:
-        Exception: If the HTTP request fails with a non-200 status code.
+    Validates both the HTTP response and any GraphQL errors returned
+    inside an HTTP 200 response.
     """
 
     access_token = get_access_token()
+
     url = "https://crick.my.rubrik.com/api/graphql"
+
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer " + access_token,
+        "Authorization": f"Bearer {access_token}",
     }
 
-    response = requests.post(url=url, headers=headers, data=json.dumps(payload))
+    response = requests.post(
+        url=url,
+        headers=headers,
+        data=json.dumps(payload),
+        timeout=60,
+    )
+
     if response.status_code != 200:
-        error_message = response.json().get("message", response.text)
-        raise BackupError(message=error_message, tag=_tag)
+        try:
+            error_message = response.json().get(
+                "message",
+                response.text,
+            )
+        except ValueError:
+            error_message = response.text
 
-    resp = response.json()
+        raise BackupError(
+            message=(
+                "Rubrik GraphQL request failed: "
+                f"HTTP {response.status_code}: {error_message}"
+            ),
+            tag=_tag,
+        )
 
-    if resp.get("errors"):
-        err_path = resp.get("errors")[0].get("path")[0]
-        err_message = resp.get("errors")[0].get("message")
-        raise BackupError(message=f"{err_message} at {err_path}", tag=_tag)
-    return resp
+    response_data = response.json()
+
+    if response_data.get("errors"):
+        first_error = response_data["errors"][0]
+
+        error_message = first_error.get(
+            "message",
+            "Rubrik GraphQL operation failed",
+        )
+
+        error_path = first_error.get("path", [])
+
+        if error_path:
+            error_message = (
+                f"{error_message} at "
+                f"{'.'.join(str(item) for item in error_path)}"
+            )
+
+        raise BackupError(
+            message=f"Rubrik GraphQL error: {error_message}",
+            tag=_tag,
+        )
+
+    return response_data
 
 
 def get_access_token():
     """
-    Obtain an access token from the Rubrik Security Cloud (RSC) API using
-    client credentials.
-
-    This function sends a POST request to the RSC client token endpoint
-    with the configured client ID and client secret. On success, it
-    extracts and returns the access token from the response.
-
-    Returns:
-        str: Access token string used for authenticating subsequent API calls.
-
-    Raises:
-        Exception: If the token request fails (non-200 HTTP response).
-                   The error response is expected to contain a code and message.
+    Obtain an access token from Rubrik Security Cloud using the
+    OAuth client-credentials flow.
     """
+
     global _access_token
 
     if not _access_token:
-        logger.log("Requesting Access token", tag=_tag)
-        response = requests.post(
-            url="https://crick.my.rubrik.com/api/client_token",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps({
-                "client_id": config.RSC_USER,
-                "client_secret": config.RSC_SECRET
-            }),
+        logger.log(
+            "Requesting Access token",
+            tag=_tag,
         )
 
-        data = response.json()
-        if response.status_code != 200:
-            err_msg = f"Failed to generate access token: {data.get('message')}"
-            raise BackupError(err_msg, tag=_tag)
-        _access_token = data.get("access_token")
-        logger.log("Access token generated successfully.", level=LogLevel.INFO, tag=_tag)
+        response = requests.post(
+            url="https://crick.my.rubrik.com/api/client_token",
+            data={
+                "client_id": config.RSC_USER,
+                "client_secret": config.RSC_SECRET,
+                "grant_type": "client_credentials",
+            },
+            timeout=30,
+        )
+
+        try:
+            response_data = response.json()
+        except ValueError as exception:
+            raise BackupError(
+                message=(
+                    "Access token request failed: "
+                    f"Invalid JSON response: {exception}"
+                ),
+                tag=_tag,
+            ) from exception
+
+        if response.status_code not in (200, 201):
+            error_message = response_data.get(
+                "message",
+                response.text,
+            )
+
+            raise BackupError(
+                message=(
+                    "Access token request failed: "
+                    f"HTTP {response.status_code}: {error_message}"
+                ),
+                tag=_tag,
+            )
+
+        _access_token = response_data.get("access_token")
+
+        if not _access_token:
+            raise BackupError(
+                message=(
+                    "Access token request failed: "
+                    "The response did not contain an access token"
+                ),
+                tag=_tag,
+            )
+
+        logger.log(
+            "Access token generated successfully.",
+            level=LogLevel.INFO,
+            tag=_tag,
+        )
+
     return _access_token
 
 
 def delete_access_token():
     """
-    Delete the current Rubrik Security Cloud (RSC) API session.
-
-    Raises:
-        Exception: If the session deletion fails.
+    Delete the current Rubrik Security Cloud API session.
     """
+
     try:
         global _access_token
+
         if _access_token:
-            logger.log("Closing Rubrik session & Deleting access token...", tag=_tag)
-            headers = {"Authorization": f"Bearer {_access_token}"}
+            logger.log(
+                "Closing Rubrik session & Deleting access token...",
+                tag=_tag,
+            )
+
+            headers = {
+                "Authorization": f"Bearer {_access_token}",
+            }
 
             response = requests.delete(
                 "https://crick.my.rubrik.com/api/session",
@@ -114,50 +174,89 @@ def delete_access_token():
             )
 
             if response.status_code != 204:
-                message = response.json().get("message", response.text)
+                try:
+                    message = response.json().get(
+                        "message",
+                        response.text,
+                    )
+                except ValueError:
+                    message = response.text
+
                 raise BackupError(
-                    message=f"Failed to Delete Access token: {message}",
-                    tag=_tag
+                    message=(
+                        "Failed to delete access token: "
+                        f"{message}"
+                    ),
+                    tag=_tag,
                 )
 
-            logger.log("Access token deleted successfully.", level=LogLevel.INFO, tag=_tag)
-            logger.log("Closed Rubrik session.\n\n", tag=_tag)
-    except BackupError as ex:
-        ex.log_error()
-        title, body = ex.message.split(":", 1)
-        EmailService.send_email(title=title, body=body)
-    except Exception as ex:
-        err = f"Failed to Delete Access token: {ex}"
-        title, body = err.split(":", 1)
+            _access_token = None
+
+            logger.log(
+                "Access token deleted successfully.",
+                level=LogLevel.INFO,
+                tag=_tag,
+            )
+
+            logger.log(
+                "Closed Rubrik session.\n\n",
+                tag=_tag,
+            )
+
+    except BackupError as exception:
+        exception.log_error()
+
+        title, separator, body = exception.message.partition(":")
+
+        if not separator:
+            title = "Rubrik session error"
+            body = exception.message
+
+        EmailService.send_email(
+            title=title.strip(),
+            body=body.strip(),
+        )
+
+    except Exception as exception:
+        error_message = f"Failed to delete access token: {exception}"
+
+        title, separator, body = error_message.partition(":")
+
+        if not separator:
+            title = "Rubrik session error"
+            body = error_message
+
         logger.log(
-            text=err,
+            text=error_message,
             level=LogLevel.ERROR,
             tag=_tag,
         )
+
         EmailService.send_email(
-            title=title,
-            body=body
+            title=title.strip(),
+            body=body.strip(),
         )
 
 
 def begin_snapshot():
     """
-    Begins a snapshot for a Managed Volume in Rubrik Security Cloud.
-
-    Returns:
-        dict: GraphQL response containing the async request status ID.
+    Open the Rubrik Managed Volume for backup writes.
     """
 
-    fid = get_mv_details().get("fid")
+    managed_volume_id = get_mv_details().get("fid")
 
     graphql_mutation_query = """
-        mutation beginManagedVolumeSnapshot($id: String!){
-            beginManagedVolumeSnapshot(input: {
-                id: $id
-                config: {isAsync: true}
-            }) {
+        mutation beginManagedVolumeSnapshot($id: String!) {
+            beginManagedVolumeSnapshot(
+                input: {
+                    id: $id
+                    config: {
+                        isAsync: true
+                    }
+                }
+            ) {
                 asyncRequestStatus {
-                    id 
+                    id
                 }
             }
         }
@@ -167,135 +266,234 @@ def begin_snapshot():
         "query": graphql_mutation_query,
         "operationName": "beginManagedVolumeSnapshot",
         "variables": {
-            "id": fid
-        }
+            "id": managed_volume_id,
+        },
     }
 
     try:
-        logger.log("Beginning snapshot...", tag=_tag)
+        logger.log(
+            "Beginning snapshot...",
+            tag=_tag,
+        )
+
         _run_query(payload=payload)
-        logger.log("Begun Snapshot", tag=_tag)
-    except BackupError as ex:
-        ex.message = f"Failed to begin snapshot: {ex.message}"
-        raise ex
+
+        logger.log(
+            "Begun Snapshot",
+            tag=_tag,
+        )
+
+    except BackupError as exception:
+        exception.message = (
+            f"Failed to begin snapshot: {exception.message}"
+        )
+        raise
 
 
 def end_snapshot():
     """
-    Ends a snapshot for a Managed Volume in Rubrik Security Cloud and
-    apply the specified SLA domain.
-
-    Returns:
-        dict: GraphQL response containing the async request status ID.
+    End the Rubrik Managed Volume snapshot and apply its effective SLA.
     """
+
     try:
         global _access_token
+
         if _access_token:
-            logger.log("Ending snapshot...", tag=_tag)
-            fid = get_mv_details().get("fid")
-            sla_id = get_mv_details().get("slaDomain").get("id")
+            logger.log(
+                "Ending snapshot...",
+                tag=_tag,
+            )
+
+            managed_volume_details = get_mv_details()
+
+            managed_volume_id = managed_volume_details.get("fid")
+
+            sla_domain = (
+                managed_volume_details.get("slaDomain")
+                or {}
+            )
+
+            sla_id = sla_domain.get("id")
+
+            if not sla_id:
+                raise BackupError(
+                    message=(
+                        "Managed Volume SLA lookup failed: "
+                        "No SLA ID found for "
+                        f"{config.managed_volume_name}"
+                    ),
+                    tag=_tag,
+                )
 
             graphql_mutation_query = """
-                      mutation endManagedVolumeSnapshot($id: String!, $slaId: String!){
-                          endManagedVolumeSnapshot(
-                              input: {
-                                  id: $id,
-                                  params: {
-                                      retentionConfig: {
-                                          slaId: $slaId
-                                      }
-                                  }
-                              }
-                          ){
-                              asyncRequestStatus {
-                                  id
-                              }
-                          }
-                      }
-                  """
+                mutation endManagedVolumeSnapshot(
+                    $id: String!
+                    $slaId: String!
+                ) {
+                    endManagedVolumeSnapshot(
+                        input: {
+                            id: $id
+                            params: {
+                                retentionConfig: {
+                                    slaId: $slaId
+                                }
+                            }
+                        }
+                    ) {
+                        asyncRequestStatus {
+                            id
+                        }
+                    }
+                }
+            """
 
             payload = {
                 "query": graphql_mutation_query,
                 "operationName": "endManagedVolumeSnapshot",
-                "variables": {"id": fid, "slaId": sla_id}
+                "variables": {
+                    "id": managed_volume_id,
+                    "slaId": sla_id,
+                },
             }
 
             _run_query(payload=payload)
-            logger.log("Ended Snapshot", tag=_tag)
-    except BackupError as ex:
-        ex.message = f"Failed to end snapshot: {ex.message}"
-        ex.log_error()
-        title, body = ex.message.split(":", 1)
-        EmailService.send_email(title=title, body=body)
-    except Exception as ex:
-        err = f"Failed to end snapshot: {ex}"
-        title, body = err.split(":", 1)
+
+            logger.log(
+                "Ended Snapshot",
+                tag=_tag,
+            )
+
+    except BackupError as exception:
+        exception.message = (
+            f"Failed to end snapshot: {exception.message}"
+        )
+
+        exception.log_error()
+
+        title, separator, body = exception.message.partition(":")
+
+        if not separator:
+            title = "Failed to end snapshot"
+            body = exception.message
+
+        EmailService.send_email(
+            title=title.strip(),
+            body=body.strip(),
+        )
+
+    except Exception as exception:
+        error_message = f"Failed to end snapshot: {exception}"
+
+        title, separator, body = error_message.partition(":")
+
+        if not separator:
+            title = "Failed to end snapshot"
+            body = error_message
+
         logger.log(
-            text=err,
+            text=error_message,
             level=LogLevel.ERROR,
             tag=_tag,
         )
+
         EmailService.send_email(
-            title=title,
-            body=body
+            title=title.strip(),
+            body=body.strip(),
         )
 
 
 def get_mv_details():
     """
-    Retrieve details for a Managed Volume (MV) from Rubrik Security Cloud
-    by name.
+    Retrieve a Rubrik Managed Volume by exact name.
 
-    This function executes a GraphQL query to search for a Managed Volume
-    matching the provided name and returns its basic details, including
-    the FID and associated SLA domain.
-
-    Returns:
-        dict: Managed Volume details containing keys such as `fid`,
-              `name`, and `slaDomain`.
-
-    Raises:
-        Exception: If no Managed Volume is found matching the given name.
-                   Note that the underlying GraphQL API may still return
-                   a successful HTTP response in this case.
+    The modern RSC managedVolumes query returns the current Managed
+    Volume ID and effective SLA domain. The result is mapped to the
+    legacy internal keys expected by begin_snapshot() and end_snapshot().
     """
 
     global _managed_volume_details
 
     if _managed_volume_details is None:
         graphql_query = """
-            query mv_id ($objectType: [ObjectTypeEnum!], $mv_name: String) {
-                snappableConnection (filter: {objectType: $objectType, searchTerm: $mv_name}) {
+            query getManagedVolumeByName(
+                $mv_name: [String!]
+            ) {
+                managedVolumes(
+                    filter: [
+                        {
+                            field: NAME_EXACT_MATCH
+                            texts: $mv_name
+                        }
+                    ]
+                ) {
                     nodes {
-                        fid
+                        id
                         name
-                        slaDomain {
+                        effectiveSlaDomain {
                             id
+                            name
                         }
                     }
                 }
             }
         """
 
-        mv_name = config.managed_volume_name
+        managed_volume_name = config.managed_volume_name
 
         payload = {
             "query": graphql_query,
+            "operationName": "getManagedVolumeByName",
             "variables": {
-                "objectType": "ManagedVolume",
-                "mv_name": mv_name,
+                "mv_name": [
+                    managed_volume_name
+                ],
             },
         }
 
-        query_output = _run_query(payload=payload)
+        query_output = _run_query(
+            payload=payload,
+        )
 
-        nodes = query_output['data']['snappableConnection']['nodes']
+        nodes = (
+            query_output
+            .get("data", {})
+            .get("managedVolumes", {})
+            .get("nodes", [])
+        )
 
-        if len(nodes) == 0:
+        if not nodes:
             raise BackupError(
-                message=f"No Managed Volume found for {mv_name}",
-                tag=_tag
+                message=(
+                    "Managed Volume lookup failed: "
+                    "No Managed Volume found for "
+                    f"{managed_volume_name}"
+                ),
+                tag=_tag,
             )
 
-        _managed_volume_details = nodes[0]
+        managed_volume = nodes[0]
+
+        effective_sla = (
+            managed_volume.get("effectiveSlaDomain")
+        )
+
+        if (
+            not effective_sla
+            or not effective_sla.get("id")
+        ):
+            raise BackupError(
+                message=(
+                    "Managed Volume SLA lookup failed: "
+                    "No effective SLA found for "
+                    f"{managed_volume_name}"
+                ),
+                tag=_tag,
+            )
+
+        _managed_volume_details = {
+            "fid": managed_volume["id"],
+            "name": managed_volume["name"],
+            "slaDomain": effective_sla,
+        }
+
     return _managed_volume_details
